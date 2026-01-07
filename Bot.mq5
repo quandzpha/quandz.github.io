@@ -18,14 +18,6 @@ input ENUM_MA_METHOD    ma_method = MODE_EMA;
 input ENUM_APPLIED_PRICE ma_price = PRICE_OPEN;
 input int               ma_shift = 0;
 
-// HI-LO SETUP
-input bool              hilo_enable = true;
-input bool              hilo_invert = false;
-input ENUM_TIMEFRAMES   hilo_timeframe = PERIOD_CURRENT;
-input int               hilo_period = 3;
-input ENUM_MA_METHOD    hilo_method = MODE_EMA;
-input int               hilo_shift = 0;
-
 // TRAILING STOP
 input bool              trailing_stop_enable = true;
 input int               trailing_start = 20;
@@ -39,28 +31,51 @@ input int               breakeven_step = 3;
 // Filter Spread
 input int               max_spread_pips = 240;
 
-// DAILY LIMITS
-input int               max_trades = 0;
-input double            max_lots = 0.0;
+// Lot Size
+input double            lot_size = 0.01;
 
-// Range of Price
-input bool              range_of_price_enable = false;
-input double            range_distance = 10.0;
+//--- Equity Protection
+enum ENUM_EQUITY_CLOSE_MODE
+{
+    AllTrades,      // All Trades
+};
+enum ENUM_DD_MODE
+{
+    EquityMoney,    // Equity Money
+};
 
-// DCA/Grid settings
-input double            initial_lot_size = 0.01;
-input int               grid_distance_pips = 20;
-input double            lot_multiplier = 1.5;
-input int               max_dca_orders = 5;
-input int               take_profit_pips = 100;
+input ENUM_EQUITY_CLOSE_MODE equity_protection_close_mode = AllTrades;
+input bool              close_chart = false;
+input bool              turn_off_autotrade = false;
+input bool              close_metatrader = false;
+input double            max_floating_drawdown_money = 0.0;
+input double            max_floating_drawdown_percentage = 0.0;
+input double            min_equity = 0.0;
+input ENUM_DD_MODE      max_dd_mode = EquityMoney;
+input double            max_dd_per_day = 0.0;
+input double            max_floating_profit_money = 0.0;
+input double            max_floating_profit_percentage = 0.0;
+input double            max_equity = 0.0;
+input ENUM_DD_MODE      daily_target_mode = EquityMoney;
+input double            daily_target = 0.0;
+
+//--- Scheduler
+input bool              use_time_filter = false;
+input string            sunday_trading_hours = "";
+input string            monday_trading_hours = "";
+input string            tuesday_trading_hours = "";
+input string            wednesday_trading_hours = "";
+input string            thursday_trading_hours = "";
+input string            friday_trading_hours = "";
+input string            saturday_trading_hours = "";
+input bool              close_all_trades_on_turn_off = true;
 
 
 //--- global variables
 CTrade trade;
 int ma_handle;
-int hilo_high_handle;
-int hilo_low_handle;
-double initial_range_price = 0;
+bool g_trading_disabled_by_equity_protection = false;
+bool g_outside_trading_hours = false;
 
 //+------------------------------------------------------------------+
 //| Expert initialization function                                   |
@@ -75,18 +90,7 @@ int OnInit()
       return(INIT_FAILED);
      }
 
-   if(hilo_enable)
-     {
-      hilo_high_handle = iMA(_Symbol, hilo_timeframe, hilo_period, hilo_shift, hilo_method, PRICE_HIGH);
-      hilo_low_handle = iMA(_Symbol, hilo_timeframe, hilo_period, hilo_shift, hilo_method, PRICE_LOW);
-      if(hilo_high_handle == INVALID_HANDLE || hilo_low_handle == INVALID_HANDLE)
-        {
-         Print("Failed to create HI-LO indicators. Error: ", GetLastError());
-         return(INIT_FAILED);
-        }
-     }
-
-   initial_range_price = 0; // Reset for range filter
+   g_trading_disabled_by_equity_protection = false; // Reset on init
 
    return(INIT_SUCCEEDED);
   }
@@ -97,11 +101,13 @@ void OnDeinit(const int reason)
   {
 //--- release indicator handles
    IndicatorRelease(ma_handle);
-   if(hilo_enable)
-     {
-      IndicatorRelease(hilo_high_handle);
-      IndicatorRelease(hilo_low_handle);
-     }
+
+   //--- Close positions if setting is enabled when EA is removed
+   if(reason != REASON_CHARTCHANGE && close_all_trades_on_turn_off)
+   {
+       Print("EA turning off. Closing all trades as per settings.");
+       CloseAllPositions();
+   }
   }
 //+------------------------------------------------------------------+
 //| Helper functions                                                 |
@@ -120,87 +126,6 @@ int CountOpenPositions(ENUM_POSITION_TYPE type)
         }
     }
     return count;
-}
-
-double GetLastOrderOpenPrice(ENUM_POSITION_TYPE type)
-{
-    double last_price = 0;
-    ulong last_time = 0;
-    for(int i = PositionsTotal() - 1; i >= 0; i--)
-    {
-        if(PositionGetSymbol(i) == _Symbol && PositionGetInteger(POSITION_TYPE) == type)
-        {
-            if(PositionGetInteger(POSITION_TIME) > last_time)
-            {
-                last_time = PositionGetInteger(POSITION_TIME);
-                last_price = PositionGetDouble(POSITION_PRICE_OPEN);
-            }
-        }
-    }
-    return last_price;
-}
-
-double GetNextLotSize(ENUM_POSITION_TYPE type)
-{
-    double last_lot = 0;
-    ulong last_time = 0;
-    for(int i = PositionsTotal() - 1; i >= 0; i--)
-    {
-        if(PositionGetSymbol(i) == _Symbol && PositionGetInteger(POSITION_TYPE) == type)
-        {
-            if(PositionGetInteger(POSITION_TIME) > last_time)
-            {
-                last_time = PositionGetInteger(POSITION_TIME);
-                last_lot = PositionGetDouble(POSITION_VOLUME);
-            }
-        }
-    }
-    return (last_lot == 0) ? initial_lot_size : NormalizeDouble(last_lot * lot_multiplier, 2);
-}
-
-void UpdatePositionsTakeProfit()
-{
-    double total_volume = 0;
-    double weighted_price_sum = 0;
-    ENUM_POSITION_TYPE position_type = (ENUM_POSITION_TYPE)-1;
-
-    for(int i = PositionsTotal() - 1; i >= 0; i--)
-    {
-        if(PositionGetSymbol(i) == _Symbol)
-        {
-            double volume = PositionGetDouble(POSITION_VOLUME);
-            double open_price = PositionGetDouble(POSITION_PRICE_OPEN);
-            total_volume += volume;
-            weighted_price_sum += open_price * volume;
-            if(position_type == (ENUM_POSITION_TYPE)-1)
-                position_type = (ENUM_POSITION_TYPE)PositionGetInteger(POSITION_TYPE);
-        }
-    }
-
-    if(total_volume == 0) return;
-
-    double vwap = weighted_price_sum / total_volume;
-    double point = SymbolInfoDouble(_Symbol, SYMBOL_POINT);
-    double tp_price = 0;
-
-    if(position_type == POSITION_TYPE_BUY)
-    {
-        tp_price = vwap + take_profit_pips * point;
-    }
-    else if(position_type == POSITION_TYPE_SELL)
-    {
-        tp_price = vwap - take_profit_pips * point;
-    }
-
-    for(int i = PositionsTotal() - 1; i >= 0; i--)
-    {
-        if(PositionGetSymbol(i) == _Symbol)
-        {
-            long ticket = PositionGetTicket(i);
-            double sl = PositionGetDouble(POSITION_SL);
-            trade.PositionModify(ticket, sl, tp_price);
-        }
-    }
 }
 
 //+------------------------------------------------------------------+
@@ -281,91 +206,287 @@ void ManageRisk()
     }
 }
 
+//+------------------------------------------------------------------+
+//| Equity Protection Helper Functions                               |
+//+------------------------------------------------------------------+
+void CloseAllPositions()
+{
+    // Close all open positions for the current symbol
+    for(int i = PositionsTotal() - 1; i >= 0; i--)
+    {
+        if(PositionGetSymbol(i) == _Symbol)
+        {
+            trade.PositionClose(PositionGetTicket(i));
+        }
+    }
+}
+
+void CheckEquityProtection()
+{
+    if(g_trading_disabled_by_equity_protection)
+        return;
+
+    // Calculate floating P/L for the current symbol only
+    double symbol_floating_pl = 0;
+    for(int i = PositionsTotal() - 1; i >= 0; i--)
+    {
+        if(PositionGetSymbol(i) == _Symbol)
+        {
+            symbol_floating_pl += PositionGetDouble(POSITION_PROFIT);
+        }
+    }
+
+    double equity = AccountInfoDouble(ACCOUNT_EQUITY);
+    double balance = AccountInfoDouble(ACCOUNT_BALANCE);
+
+    bool limit_reached = false;
+    string trigger_reason = "";
+
+    // Note: Min/Max Equity checks are account-wide by nature.
+    // Check Min Equity
+    if(min_equity > 0 && equity <= min_equity)
+    {
+        limit_reached = true;
+        trigger_reason = "Minimum equity level reached.";
+    }
+    // Check Max Equity
+    if(!limit_reached && max_equity > 0 && equity >= max_equity)
+    {
+        limit_reached = true;
+        trigger_reason = "Maximum equity target reached.";
+    }
+
+    // The following checks are now based on the symbol's floating P/L
+    // Check Max Floating Drawdown Money
+    if(!limit_reached && max_floating_drawdown_money > 0 && symbol_floating_pl < 0 && -symbol_floating_pl >= max_floating_drawdown_money)
+    {
+        limit_reached = true;
+        trigger_reason = "Maximum floating drawdown in money for " + _Symbol + " reached.";
+    }
+    // Check Max Floating Drawdown Percentage
+    if(!limit_reached && max_floating_drawdown_percentage > 0 && balance > 0 && symbol_floating_pl < 0)
+    {
+        if(((-symbol_floating_pl / balance) * 100.0) >= max_floating_drawdown_percentage)
+        {
+            limit_reached = true;
+            trigger_reason = "Maximum floating drawdown in percentage for " + _Symbol + " reached.";
+        }
+    }
+    // Check Max Floating Profit Money
+    if(!limit_reached && max_floating_profit_money > 0 && symbol_floating_pl >= max_floating_profit_money)
+    {
+        limit_reached = true;
+        trigger_reason = "Maximum floating profit in money for " + _Symbol + " reached.";
+    }
+    // Check Max Floating Profit Percentage
+    if(!limit_reached && max_floating_profit_percentage > 0 && balance > 0 && symbol_floating_pl > 0)
+    {
+        if(((symbol_floating_pl / balance) * 100.0) >= max_floating_profit_percentage)
+        {
+            limit_reached = true;
+            trigger_reason = "Maximum floating profit in percentage for " + _Symbol + " reached.";
+        }
+    }
+
+    if(limit_reached)
+    {
+        Print("Equity Protection Triggered on " + _Symbol + ": " + trigger_reason);
+        CloseAllPositions(); // This function correctly closes positions only for the current symbol.
+
+        if(turn_off_autotrade)
+        {
+            Print("Trading has been disabled by Equity Protection.");
+            g_trading_disabled_by_equity_protection = true;
+        }
+        if(close_chart)
+        {
+            ChartClose();
+        }
+        if(close_metatrader)
+        {
+            TerminalClose();
+        }
+    }
+}
+
+//+------------------------------------------------------------------+
+//| Time Filter Helper Function                                      |
+//+------------------------------------------------------------------+
+bool IsTradingAllowed()
+{
+    if(!use_time_filter)
+        return true;
+
+    MqlDateTime time_struct;
+    TimeCurrent(time_struct);
+
+    string trading_hours_today = "";
+    switch(time_struct.day_of_week)
+    {
+        case 0: trading_hours_today = sunday_trading_hours; break;
+        case 1: trading_hours_today = monday_trading_hours; break;
+        case 2: trading_hours_today = tuesday_trading_hours; break;
+        case 3: trading_hours_today = wednesday_trading_hours; break;
+        case 4: trading_hours_today = thursday_trading_hours; break;
+        case 5: trading_hours_today = friday_trading_hours; break;
+        case 6: trading_hours_today = saturday_trading_hours; break;
+    }
+
+    if(trading_hours_today == "")
+        return false; // No hours defined for today means no trading
+
+    StringTrim(trading_hours_today);
+    string sessions[];
+    int num_sessions = StringSplit(trading_hours_today, ',', sessions);
+
+    for(int i = 0; i < num_sessions; i++)
+    {
+        string parts[];
+        if(StringSplit(sessions[i], '-', parts) != 2)
+            continue; // Invalid format
+
+        string start_time_str = parts[0];
+        string end_time_str = parts[1];
+
+        string start_parts[];
+        string end_parts[];
+
+        if(StringSplit(start_time_str, ':', start_parts) != 2 || StringSplit(end_time_str, ':', end_parts) != 2)
+            continue; // Invalid format
+
+        int start_hour = (int)StringToInteger(start_parts[0]);
+        int start_min = (int)StringToInteger(start_parts[1]);
+        int end_hour = (int)StringToInteger(end_parts[0]);
+        int end_min = (int)StringToInteger(end_parts[1]);
+
+        int current_time_in_minutes = time_struct.hour * 60 + time_struct.min;
+        int start_time_in_minutes = start_hour * 60 + start_min;
+        int end_time_in_minutes = end_hour * 60 + end_min;
+
+        if(current_time_in_minutes >= start_time_in_minutes && current_time_in_minutes < end_time_in_minutes)
+        {
+            return true; // We are inside a valid session
+        }
+    }
+
+    return false; // Not in any valid session
+}
+
 
 //+------------------------------------------------------------------+
 //| Expert tick function                                             |
 //+------------------------------------------------------------------+
 void OnTick()
 {
+    if(g_trading_disabled_by_equity_protection)
+    {
+        Comment("TRADING DISABLED BY EQUITY PROTECTION");
+        return;
+    }
+
+    //--- Check equity protection at the start of every tick
+    CheckEquityProtection();
+
+    //--- Check Time Filter
+    if(!IsTradingAllowed())
+    {
+        if(close_all_trades_on_turn_off && !g_outside_trading_hours)
+        {
+            CloseAllPositions();
+            Print("Trading session ended. Closing all positions.");
+        }
+        g_outside_trading_hours = true;
+        Comment("OUTSIDE TRADING HOURS");
+        return;
+    }
+    else
+    {
+        // Reset the flag when we re-enter a valid session
+        g_outside_trading_hours = false;
+        Comment(""); // Clear the comment
+    }
+
     //--- Always run position management first
     if(PositionsTotal() > 0)
     {
-        UpdatePositionsTakeProfit();
+        // Trailing stop is still relevant for the single position strategy
         ManageRisk();
     }
 
-    //--- PRE-TRADE CHECKS for opening NEW positions ---
+    //--- Check for new bar to execute trading logic once per bar ---
+    static datetime last_bar_time = 0;
+    datetime current_bar_time = (datetime)SeriesInfoInteger(_Symbol, Period(), SERIES_LASTBAR_DATE);
 
-    //--- Get current prices for checks
+    if(current_bar_time <= last_bar_time)
+    {
+        return; // Not a new bar yet, exit
+    }
+    last_bar_time = current_bar_time; // It's a new bar, update the time
+
+    //--- Get data for the most recently completed bar (index 1) ---
+    double open_prices[1];
+    double ma_values[1];
+    if(CopyRates(_Symbol, Period(), 1, 1, open_prices) <= 0) return;
+    if(CopyBuffer(ma_handle, 0, 1, 1, ma_values) <= 0) return;
+
+    double bar_open = open_prices[0];
+    double ema_value = ma_values[0];
+
+    //--- Core Trading Logic: Always in the market ---
+
+    // Get current market state
     MqlTick latest_tick;
     if(!SymbolInfoTick(_Symbol, latest_tick)) return;
     double ask = latest_tick.ask;
     double bid = latest_tick.bid;
-    double point = SymbolInfoDouble(_Symbol, SYMBOL_POINT);
 
-    //--- 1. Check Spread
-    if(SymbolInfoInteger(_Symbol, SYMBOL_SPREAD) > max_spread_pips) return;
+    int buy_positions = CountOpenPositions(POSITION_TYPE_BUY);
+    int sell_positions = CountOpenPositions(POSITION_TYPE_SELL);
 
-    //--- 2. Check Range of Price
-    if(range_of_price_enable)
+    // Condition: Open price is ABOVE EMA -> We should be SELLING
+    if(bar_open > ema_value)
     {
-        if(initial_range_price == 0) initial_range_price = (ask + bid) / 2.0;
-        if(ask > initial_range_price + range_distance || bid < initial_range_price - range_distance) return;
-    }
-
-    //--- 3. Check Max Trades
-    int total_positions = PositionsTotal();
-    if(max_trades > 0 && total_positions >= max_trades) return;
-
-    //--- 4. Check Max Lots
-    double current_lots = 0;
-    for(int i = total_positions - 1; i >= 0; i--) {
-        if(PositionGetSymbol(i) == _Symbol) {
-            current_lots += PositionGetDouble(POSITION_VOLUME);
+        // 1. Close any existing BUY positions
+        if(buy_positions > 0)
+        {
+            for(int i = PositionsTotal() - 1; i >= 0; i--)
+            {
+                if(PositionGetSymbol(i) == _Symbol && PositionGetInteger(POSITION_TYPE) == POSITION_TYPE_BUY)
+                {
+                    trade.PositionClose(PositionGetTicket(i));
+                }
+            }
+        }
+        // 2. Open a SELL position if there isn't one already
+        if(CountOpenPositions(POSITION_TYPE_SELL) == 0)
+        {
+             if(SymbolInfoInteger(_Symbol, SYMBOL_SPREAD) <= max_spread_pips) // Check spread before opening
+             {
+                trade.Sell(lot_size, _Symbol, bid, 0, 0, "EMA Cross Sell");
+             }
         }
     }
-
-    //--- Passed all checks, now get indicator values for trading signals
-    double ma_value[1];
-    double hilo_high_value[1];
-    double hilo_low_value[1];
-    if(CopyBuffer(ma_handle, 0, 0, 1, ma_value) <= 0) return;
-    if(hilo_enable && (CopyBuffer(hilo_high_handle, 0, 0, 1, hilo_high_value) <= 0 || CopyBuffer(hilo_low_handle, 0, 0, 1, hilo_low_value) <= 0)) return;
-
-    //--- Initial Entry Logic
-    if(total_positions == 0)
+    // Condition: Open price is BELOW EMA -> We should be BUYING
+    else if(bar_open < ema_value)
     {
-        if(max_lots > 0 && initial_lot_size > max_lots) return;
-
-        bool buy_signal = ask > ma_value[0] && (!hilo_enable || ask > hilo_high_value[0]);
-        bool sell_signal = bid < ma_value[0] && (!hilo_enable || bid < hilo_low_value[0]);
-        if(hilo_invert) { buy_signal = !buy_signal; sell_signal = !sell_signal; }
-
-        if(buy_signal)
-            trade.Buy(initial_lot_size, _Symbol, ask, 0, 0, "Initial Buy");
-        else if(sell_signal)
-            trade.Sell(initial_lot_size, _Symbol, bid, 0, 0, "Initial Sell");
-    }
-    //--- DCA/Grid Logic
-    else
-    {
-        int buy_positions = CountOpenPositions(POSITION_TYPE_BUY);
-        int sell_positions = CountOpenPositions(POSITION_TYPE_SELL);
-        if(buy_positions > 0 && buy_positions < max_dca_orders)
+        // 1. Close any existing SELL positions
+        if(sell_positions > 0)
         {
-            double next_lot = GetNextLotSize(POSITION_TYPE_BUY);
-            if(max_lots > 0 && current_lots + next_lot > max_lots) return;
-            double last_buy_price = GetLastOrderOpenPrice(POSITION_TYPE_BUY);
-            if(ask < last_buy_price - grid_distance_pips * point)
-                trade.Buy(next_lot, _Symbol, ask, 0, 0, "DCA Buy");
+            for(int i = PositionsTotal() - 1; i >= 0; i--)
+            {
+                if(PositionGetSymbol(i) == _Symbol && PositionGetInteger(POSITION_TYPE) == POSITION_TYPE_SELL)
+                {
+                    trade.PositionClose(PositionGetTicket(i));
+                }
+            }
         }
-        else if(sell_positions > 0 && sell_positions < max_dca_orders)
+        // 2. Open a BUY position if there isn't one already
+        if(CountOpenPositions(POSITION_TYPE_BUY) == 0)
         {
-            double next_lot = GetNextLotSize(POSITION_TYPE_SELL);
-            if(max_lots > 0 && current_lots + next_lot > max_lots) return;
-            double last_sell_price = GetLastOrderOpenPrice(POSITION_TYPE_SELL);
-            if(bid > last_sell_price + grid_distance_pips * point)
-                trade.Sell(next_lot, _Symbol, bid, 0, 0, "DCA Sell");
+             if(SymbolInfoInteger(_Symbol, SYMBOL_SPREAD) <= max_spread_pips) // Check spread before opening
+             {
+                trade.Buy(lot_size, _Symbol, ask, 0, 0, "EMA Cross Buy");
+             }
         }
     }
 }
