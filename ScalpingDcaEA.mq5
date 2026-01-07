@@ -302,34 +302,53 @@ void ManagePositions()
    datetime last_buy_open_time = 0;
    datetime last_sell_open_time = 0;
 
+   //--- Variables for average price calculation
+   double total_buy_volume = 0;
+   double weighted_buy_price_sum = 0;
+   double total_sell_volume = 0;
+   double weighted_sell_price_sum = 0;
+
    //--- Iterate through all open positions
    for(int i = PositionsTotal() - 1; i >= 0; i--)
    {
       ulong ticket = PositionGetTicket(i);
       if(PositionGetInteger(POSITION_MAGIC) == InpMagicNumber && PositionGetString(POSITION_SYMBOL) == _Symbol)
       {
+         double open_price = PositionGetDouble(POSITION_PRICE_OPEN);
+         double volume = PositionGetDouble(POSITION_VOLUME);
+
          if(PositionGetInteger(POSITION_TYPE) == POSITION_TYPE_BUY)
          {
             total_profit_buy += PositionGetDouble(POSITION_PROFIT);
             buy_positions_count++;
+
+            //--- Accumulate for average price calculation
+            total_buy_volume += volume;
+            weighted_buy_price_sum += open_price * volume;
+
             if((datetime)PositionGetInteger(POSITION_TIME) > last_buy_open_time)
             {
                last_buy_open_time = (datetime)PositionGetInteger(POSITION_TIME);
                last_buy_ticket = ticket;
-               last_buy_open_price = PositionGetDouble(POSITION_PRICE_OPEN);
-               last_buy_lots = PositionGetDouble(POSITION_VOLUME);
+               last_buy_open_price = open_price;
+               last_buy_lots = volume;
             }
          }
          else if(PositionGetInteger(POSITION_TYPE) == POSITION_TYPE_SELL)
          {
             total_profit_sell += PositionGetDouble(POSITION_PROFIT);
             sell_positions_count++;
+
+            //--- Accumulate for average price calculation
+            total_sell_volume += volume;
+            weighted_sell_price_sum += open_price * volume;
+
             if((datetime)PositionGetInteger(POSITION_TIME) > last_sell_open_time)
             {
                last_sell_open_time = (datetime)PositionGetInteger(POSITION_TIME);
                last_sell_ticket = ticket;
-               last_sell_open_price = PositionGetDouble(POSITION_PRICE_OPEN);
-               last_sell_lots = PositionGetDouble(POSITION_VOLUME);
+               last_sell_open_price = open_price;
+               last_sell_lots = volume;
             }
          }
       }
@@ -353,8 +372,25 @@ void ManagePositions()
       double current_price = SymbolInfoDouble(_Symbol, SYMBOL_ASK);
       if(last_buy_open_price - current_price >= InpDcaDistance * _Point)
       {
-         double sl = InpStopLoss > 0 ? current_price - InpStopLoss * _Point : 0;
-         trade.Buy(last_buy_lots * InpLotMultiplier, _Symbol, current_price, sl, 0, "DCA Buy");
+         double new_dca_lot_size = last_buy_lots * InpLotMultiplier;
+         double new_sl = 0;
+
+         if(InpStopLoss > 0)
+         {
+            //--- Calculate the new average price including the new DCA trade
+            double future_total_volume = total_buy_volume + new_dca_lot_size;
+            double future_weighted_price_sum = weighted_buy_price_sum + (current_price * new_dca_lot_size);
+            double new_avg_price = future_weighted_price_sum / future_total_volume;
+            new_sl = new_avg_price - InpStopLoss * _Point;
+         }
+
+         if(trade.Buy(new_dca_lot_size, _Symbol, current_price, new_sl, 0, "DCA Buy"))
+         {
+            if(InpStopLoss > 0)
+            {
+               ModifyAllPositionsSL(POSITION_TYPE_BUY, new_sl);
+            }
+         }
       }
    }
 
@@ -364,8 +400,45 @@ void ManagePositions()
       double current_price = SymbolInfoDouble(_Symbol, SYMBOL_BID);
       if(current_price - last_sell_open_price >= InpDcaDistance * _Point)
       {
-         double sl = InpStopLoss > 0 ? current_price + InpStopLoss * _Point : 0;
-         trade.Sell(last_sell_lots * InpLotMultiplier, _Symbol, current_price, sl, 0, "DCA Sell");
+         double new_dca_lot_size = last_sell_lots * InpLotMultiplier;
+         double new_sl = 0;
+
+         if(InpStopLoss > 0)
+         {
+            //--- Calculate the new average price including the new DCA trade
+            double future_total_volume = total_sell_volume + new_dca_lot_size;
+            double future_weighted_price_sum = weighted_sell_price_sum + (current_price * new_dca_lot_size);
+            double new_avg_price = future_weighted_price_sum / future_total_volume;
+            new_sl = new_avg_price + InpStopLoss * _Point;
+         }
+
+         if(trade.Sell(new_dca_lot_size, _Symbol, current_price, new_sl, 0, "DCA Sell"))
+         {
+            if(InpStopLoss > 0)
+            {
+               ModifyAllPositionsSL(POSITION_TYPE_SELL, new_sl);
+            }
+         }
+      }
+   }
+}
+
+//+------------------------------------------------------------------+
+//| Modifies the Stop Loss for all positions of a specific type      |
+//+------------------------------------------------------------------+
+void ModifyAllPositionsSL(ENUM_POSITION_TYPE type, double new_sl)
+{
+   if(new_sl == 0) // Do not modify if SL is disabled or not set
+      return;
+
+   for(int i = PositionsTotal() - 1; i >= 0; i--)
+   {
+      ulong ticket = PositionGetTicket(i);
+      if(PositionGetInteger(POSITION_MAGIC) == InpMagicNumber &&
+         PositionGetString(POSITION_SYMBOL) == _Symbol &&
+         PositionGetInteger(POSITION_TYPE) == type)
+      {
+         trade.PositionModify(ticket, new_sl, PositionGetDouble(POSITION_TP));
       }
    }
 }
